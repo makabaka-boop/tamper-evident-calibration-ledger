@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field, JsonValue
+
+ShortText = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class SubmitReport(BaseModel):
+    business_key: ShortText
+    instrument_id: ShortText
+    operator_id: ShortText
+    report: JsonValue
+
+
+class SubmitRevision(SubmitReport):
+    """A report submission that explicitly succeeds an immutable event."""
+
+
+class SubmitRevocation(BaseModel):
+    business_key: ShortText
+    operator_id: ShortText
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
+class VerifyRequest(BaseModel):
+    receipt: dict[str, Any]
+
+
+class EventView(BaseModel):
+    sequence: int
+    event_id: UUID
+    record_id: UUID
+    event_type: Literal["report", "revision", "revocation"]
+    business_key: str
+    content_fingerprint: str
+    instrument_id: str
+    operator_id: str
+    report_digest: str | None
+    previous_event_id: UUID | None
+    reason: str | None
+    occurred_at: str
+    leaf_hash: str
+
+
+class ErrorEnvelope(BaseModel):
+    error: dict[str, Any]

@@ -1,0 +1,82 @@
+name: calibration-ledger-0004
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ledger}
+      POSTGRES_USER: ${POSTGRES_USER:-ledger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env and set secrets}
+    volumes:
+      - ./.data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    env_file: .env
+    command: ["sh", "-c", "python scripts/wait_for_db.py && alembic upgrade head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  api:
+    build: .
+    env_file: .env
+    command: ["uvicorn", "ledger.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["${LEDGER_API_PORT:-8000}:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    restart: unless-stopped
+
+  sealer:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "ledger.sealer"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from pathlib import Path; import time; p=Path('/tmp/ledger-sealer-ready'); raise SystemExit(0 if p.exists() and time.time()-p.stat().st_mtime < 30 else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    restart: unless-stopped

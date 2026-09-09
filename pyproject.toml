@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tamper-evident-calibration-ledger"
+version = "1.0.0"
+description = "Append-only calibration event ledger with independently verifiable Merkle checkpoints"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.13,<2",
+  "asyncpg>=0.29,<1",
+  "fastapi>=0.115,<1",
+  "pydantic-settings>=2.5,<3",
+  "sqlalchemy[asyncio]>=2.0.35,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "aiosqlite>=0.20,<1",
+  "httpx>=0.27,<1",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+calibration-ledger-sealer = "ledger.sealer:main"
+calibration-ledger-verify = "ledger.verify:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ledger"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["postgres: requires TEST_DATABASE_URL pointing to PostgreSQL"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

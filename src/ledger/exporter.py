@@ -41,6 +41,21 @@ async def run() -> None:
     try:
         while not stop.is_set():
             try:
+                # Converge cancelling tasks whose owning worker died (including tasks that
+                # were already cancelling when this process started) before claiming work.
+                async with factory() as session:
+                    settled = await service.settle_stale_cancelling(session)
+                for package in settled:
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "audit_package_cancel_confirmed",
+                                "package_id": str(package.package_id),
+                                "reason": "lease_expired",
+                                "attempt_count": package.attempt_count,
+                            }
+                        )
+                    )
                 async with factory() as session:
                     claimed = await service.claim_package(
                         session, worker_id=worker_id, lease_duration=lease
@@ -56,6 +71,28 @@ async def run() -> None:
                                     "event": "audit_package_ready",
                                     "package_id": str(claimed.package_id),
                                     "attempt_count": claimed.attempt_count,
+                                }
+                            )
+                        )
+                    elif status == "cancelled":
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "audit_package_cancel_confirmed",
+                                    "package_id": str(claimed.package_id),
+                                    "reason": "requested",
+                                    "attempt_count": claimed.attempt_count,
+                                }
+                            )
+                        )
+                    elif status == "superseded":
+                        # The lease was lost and another path already settled the task;
+                        # it owns the single confirmation/failure log.
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "audit_package_claim_superseded",
+                                    "package_id": str(claimed.package_id),
                                 }
                             )
                         )

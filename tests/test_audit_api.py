@@ -165,9 +165,7 @@ async def test_audit_package_create_status_download_lifecycle(tmp_path) -> None:
             # expose the report digest, and the bytes are DEFLATE-compressed anyway.
             assert TEST_KEY_V1 not in data
             with zipfile.ZipFile(io.BytesIO(data)) as re_opened:
-                decompressed = b"".join(
-                    re_opened.read(name) for name in re_opened.namelist()
-                )
+                decompressed = b"".join(re_opened.read(name) for name in re_opened.namelist())
             # Only the report digest appears; the submitted report payload is absent.
             assert b'"report":{' not in decompressed
             assert b"reading" not in decompressed
@@ -192,9 +190,7 @@ async def test_audit_package_idempotency_replay_and_conflict(tmp_path) -> None:
     assert first.status_code == 201
     assert second.status_code == 200
     assert second.json()["created"] is False
-    assert (
-        second.json()["package"]["package_id"] == first.json()["package"]["package_id"]
-    )
+    assert second.json()["package"]["package_id"] == first.json()["package"]["package_id"]
     assert conflict.status_code == 409
     body = conflict.json()["error"]
     assert body["code"] == "IDEMPOTENCY_CONFLICT"
@@ -314,9 +310,7 @@ async def test_database_failure_maps_to_503_for_audit_endpoints() -> None:
                 "/v1/audit-packages",
                 json={"instrument_id": "CAL-HTTP", "idempotency_key": "db-down"},
             )
-            fetched = await client.get(
-                "/v1/audit-packages/22222222-2222-2222-2222-222222222222"
-            )
+            fetched = await client.get("/v1/audit-packages/22222222-2222-2222-2222-222222222222")
             downloaded = await client.get(
                 "/v1/audit-packages/22222222-2222-2222-2222-222222222222/download"
             )
@@ -324,6 +318,188 @@ async def test_database_failure_maps_to_503_for_audit_endpoints() -> None:
     assert created.json()["error"]["code"] == "DATABASE_UNAVAILABLE"
     assert fetched.status_code == 503
     assert downloaded.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_package_is_immediate_and_idempotent(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'audit-cancel.db'}"
+    await _prepared_database(database_url)
+    app = _app(database_url)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post(
+                "/v1/audit-packages",
+                json={"instrument_id": "CAL-HTTP", "idempotency_key": "cancel-1"},
+            )
+            package_id = created.json()["package"]["package_id"]
+
+            first = await client.post(f"/v1/audit-packages/{package_id}/cancel")
+            assert first.status_code == 200
+            body = first.json()
+            assert body["changed"] is True
+            pkg = body["package"]
+            assert pkg["status"] == "cancelled"
+            assert pkg["cancellation"]["requested_at"]
+            assert pkg["cancellation"]["cancelled_at"] == pkg["cancellation"]["requested_at"]
+            assert pkg["artifact"] is None
+            assert pkg["failure"] is None
+            assert pkg["attempt_count"] == 0
+
+            fetched = await client.get(f"/v1/audit-packages/{package_id}")
+            assert fetched.json()["package"]["status"] == "cancelled"
+            assert fetched.json()["package"]["cancellation"]["cancelled_at"]
+
+            # Repeated cancellation is a no-op that returns the current task.
+            repeat = await client.post(f"/v1/audit-packages/{package_id}/cancel")
+            assert repeat.status_code == 200
+            assert repeat.json()["changed"] is False
+            assert repeat.json()["package"]["status"] == "cancelled"
+            assert (
+                repeat.json()["package"]["cancellation"] == first.json()["package"]["cancellation"]
+            )
+
+            download = await client.get(f"/v1/audit-packages/{package_id}/download")
+            assert download.status_code == 409
+            error = download.json()["error"]
+            assert error["code"] == "AUDIT_PACKAGE_NOT_READY"
+            assert error["details"]["status"] == "cancelled"
+            assert error["details"]["retryable"] is False
+
+            retry = await client.post(f"/v1/audit-packages/{package_id}/retry")
+            assert retry.status_code == 409
+            assert retry.json()["error"]["code"] == "AUDIT_PACKAGE_NOT_RETRYABLE"
+            assert retry.json()["error"]["details"]["status"] == "cancelled"
+
+            # A cancelled package is never claimed: a subsequent build run finds nothing.
+            from datetime import timedelta
+
+            from sqlalchemy import func, select
+
+            from ledger.models import AuditPackageArtifact
+
+            factory = app.state.session_factory
+            service = AuditPackageService(clock=lambda: FIXED)
+            async with factory() as session:
+                assert (
+                    await service.claim_package(
+                        session, worker_id="w", lease_duration=timedelta(minutes=5)
+                    )
+                    is None
+                )
+                artifacts = await session.scalar(
+                    select(func.count()).select_from(AuditPackageArtifact)
+                )
+            assert artifacts == 0
+            assert (await client.get(f"/v1/audit-packages/{package_id}")).json()["package"][
+                "status"
+            ] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_building_package_flows_through_cancelling_to_cancelled(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'audit-cancel-building.db'}"
+    await _prepared_database(database_url)
+    app = _app(database_url)
+    transport = httpx.ASGITransport(app=app)
+    from datetime import timedelta
+
+    from sqlalchemy import func, select
+
+    from ledger.models import AuditPackageArtifact
+
+    async with app.router.lifespan_context(app):
+        factory = app.state.session_factory
+        service = AuditPackageService(clock=lambda: FIXED)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post(
+                "/v1/audit-packages",
+                json={"instrument_id": "CAL-HTTP", "idempotency_key": "cancel-2"},
+            )
+            package_id = created.json()["package"]["package_id"]
+
+            async with factory() as session:
+                claimed = await service.claim_package(
+                    session, worker_id="w1", lease_duration=timedelta(minutes=5)
+                )
+            assert claimed is not None
+
+            cancelling = await client.post(f"/v1/audit-packages/{package_id}/cancel")
+            assert cancelling.status_code == 200
+            assert cancelling.json()["changed"] is True
+            cbody = cancelling.json()["package"]
+            assert cbody["status"] == "cancelling"
+            assert cbody["cancellation"]["requested_at"]
+            assert cbody["cancellation"]["cancelled_at"] is None
+
+            # While cancelling, the download and retry gates carry the actual state.
+            blocked_download = await client.get(f"/v1/audit-packages/{package_id}/download")
+            assert blocked_download.status_code == 409
+            assert blocked_download.json()["error"]["details"]["status"] == "cancelling"
+            blocked_retry = await client.post(f"/v1/audit-packages/{package_id}/retry")
+            assert blocked_retry.status_code == 409
+            assert blocked_retry.json()["error"]["code"] == "AUDIT_PACKAGE_NOT_RETRYABLE"
+            assert blocked_retry.json()["error"]["details"]["status"] == "cancelling"
+
+        # The same owning worker continues its build loop and honours the cancel.
+        assert await service.build_once(factory, claimed, KEYRING) == "cancelled"
+        async with factory() as session:
+            assert await session.scalar(select(func.count()).select_from(AuditPackageArtifact)) == 0
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            final = await client.get(f"/v1/audit-packages/{package_id}")
+            assert final.json()["package"]["status"] == "cancelled"
+            assert final.json()["package"]["cancellation"]["cancelled_at"]
+            download = await client.get(f"/v1/audit-packages/{package_id}/download")
+            assert download.json()["error"]["details"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_ready_commit_conflicts_and_unknown_uses_envelope(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'audit-cancel-ready.db'}"
+    await _prepared_database(database_url)
+    app = _app(database_url)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        factory = app.state.session_factory
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post(
+                "/v1/audit-packages",
+                json={"instrument_id": "CAL-HTTP", "idempotency_key": "cancel-3"},
+            )
+            package_id = created.json()["package"]["package_id"]
+            await _build_package(factory, package_id)
+
+            conflict = await client.post(f"/v1/audit-packages/{package_id}/cancel")
+            assert conflict.status_code == 409
+            error = conflict.json()["error"]
+            assert error["code"] == "AUDIT_PACKAGE_ALREADY_READY"
+            assert error["details"]["status"] == "ready"
+            # The immutable ready artifact still downloads.
+            assert (
+                await client.get(f"/v1/audit-packages/{package_id}/download")
+            ).status_code == 200
+
+            unknown = await client.post(
+                "/v1/audit-packages/33333333-3333-3333-3333-333333333333/cancel"
+            )
+            assert unknown.status_code == 404
+            assert unknown.json()["error"]["code"] == "NOT_FOUND"
+            assert unknown.json()["error"]["details"]["entity"] == "audit_package"
+
+
+@pytest.mark.asyncio
+async def test_cancel_database_failure_maps_to_503() -> None:
+    broken_url = "sqlite+aiosqlite:////nonexistent-ledger-dir/cancel.db"
+    app = _app(broken_url)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            cancelled = await client.post(
+                "/v1/audit-packages/44444444-4444-4444-4444-444444444444/cancel"
+            )
+    assert cancelled.status_code == 503
+    assert cancelled.json()["error"]["code"] == "DATABASE_UNAVAILABLE"
 
 
 @pytest.mark.asyncio

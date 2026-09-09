@@ -143,21 +143,53 @@ Track the task and download only when ready:
 
 ```sh
 curl -sS http://localhost:8000/v1/audit-packages/PACKAGE_ID
-# status is pending, building, ready, or failed; failed includes a failure code/reason and the
-# attempt_count is incremented on every claim (including crash-timeout reclaims).
+# status is pending, building, ready, failed, cancelling, or cancelled; failed includes a
+# failure code/reason and the attempt_count is incremented on every claim (including
+# crash-timeout reclaims)
 curl -fsS -o cal-007.zip \
   http://localhost:8000/v1/audit-packages/PACKAGE_ID/download
 ```
 
-Downloads of `pending`, `building`, or `failed` packages return 409 `AUDIT_PACKAGE_NOT_READY`;
-unknown packages use the standard 404 `NOT_FOUND` envelope. A terminal failure is recoverable:
+Downloads of `pending`, `building`, `cancelling`, `cancelled`, or `failed` packages return
+409 `AUDIT_PACKAGE_NOT_READY` carrying the actual `status` (and `retryable: true` only for
+`failed`); unknown packages use the standard 404 `NOT_FOUND` envelope.
+
+### Cancelling a wrong selection
+
+If the instrument or export range was chosen incorrectly, cancel a task that has not
+finished:
+
+```sh
+curl -sS -X POST http://localhost:8000/v1/audit-packages/PACKAGE_ID/cancel
+```
+
+`pending` tasks move straight to `cancelled` inside a row-locked transaction. A `building`
+task moves to `cancelling` and records `cancellation.requested_at`; the owning worker checks
+the status while generating receipts and again before writing the artifact, discards its
+in-memory result, and finalizes `cancelled` without ever creating a downloadable artifact.
+The decision between cancellation and completion is made on the same task row lock: if the
+worker's `ready` commit wins, the cancel returns 409 `AUDIT_PACKAGE_ALREADY_READY` and the
+immutable ZIP remains downloadable; if the cancel commits first, the worker cannot write an
+artifact. Repeating the request after a cancellation is idempotent (200, `changed: false`,
+no additional state change). A `failed` task is not cancellable (409
+`AUDIT_PACKAGE_NOT_CANCELLABLE`) — use retry instead. Downloads of `cancelling`/`cancelled`
+packages return `AUDIT_PACKAGE_NOT_READY` with the actual status, and retry of either state
+returns 409 `AUDIT_PACKAGE_NOT_RETRYABLE`; create a new package instead. Cancelling a package
+never moves the fixed checkpoint boundary, changes the attempt count, appends events/checkpoints,
+or touches other packages. If an exporter dies while a task is `cancelling`, the next exporter
+startup (and every poll) converges the lease-expired row to `cancelled` and logs an
+`audit_package_cancel_confirmed` event (`reason: lease_expired`); a live worker confirmation
+logs the same event with `reason: requested`.
+
+A terminal failure is recoverable:
 
 ```sh
 curl -sS -X POST http://localhost:8000/v1/audit-packages/PACKAGE_ID/retry
 ```
 
-Retry only applies to `failed` packages (other states return a distinct 409 code) and requeues the
-task without changing `instrument_id`, `checkpoint_id`, or the request fingerprint.
+Retry only applies to `failed` packages (other states return a distinct 409 code, including
+`AUDIT_PACKAGE_NOT_RETRYABLE` for `cancelling`/`cancelled`) and requeues the task without
+changing `instrument_id`, `checkpoint_id`, or the request fingerprint.
 
 The independent `exporter` worker claims one task at a time with `FOR UPDATE SKIP LOCKED`
 (SQLite uses an equivalent compare-and-set claim), so scaled replicas never build the same
@@ -254,6 +286,14 @@ Recommended staging drills:
 - **Exporter failure and retry:** point the exporter at a keyring missing the checkpoint's key
   version, observe `failed` with `UNKNOWN_KEY_VERSION`, restore the key, `POST
   /v1/audit-packages/{id}/retry`, and verify the ready ZIP matches the fixed boundary.
+- **Cancellation:** create two packages; cancel one while `pending` (immediate `cancelled`,
+  never claimed, no artifact) and another while `building` (observe `cancelling` with
+  `requested_at`, then the exporter log `audit_package_cancel_confirmed` and `cancelled`);
+  repeat the cancel (idempotent), confirm 409 `AUDIT_PACKAGE_NOT_READY` downloads and 409
+  `AUDIT_PACKAGE_NOT_RETRYABLE` retries carry the actual status, and cancel a package whose
+  build commits `ready` simultaneously to observe 409 `AUDIT_PACKAGE_ALREADY_READY` with the
+  ZIP intact. Kill an exporter while a task is `cancelling`, restart, and confirm the stale
+  row converges to `cancelled` with no artifact.
 - **Deterministic archive:** build the same package twice from restored identical data and compare
   both ZIP bytes and the manifest archive SHA-256.
 - **Migration failure:** temporarily use a bad database URL for `migrate`; API/sealer must remain
@@ -292,5 +332,10 @@ and sealer races. Audit-package coverage adds package creation and idempotency c
 and uncovered sealed boundaries, boundary isolation against later sealing, deterministic archive
 bytes and digests on rebuild, per-receipt offline verification inside the ZIP, dual-worker
 claiming, crash-lease recovery, terminal failure and boundary-preserving retry, download status
-gating, and database-failure mapping; the PostgreSQL opt-in run additionally races concurrent
-exporter claims.
+gating, and database-failure mapping. Cancellation coverage adds immediate `pending`
+cancellation with idempotent repeats, cooperative `building` cancellation during receipt
+generation, the row-lock barrier that refuses to write an artifact after a committed cancel,
+the ready-wins 409 ordering, absence of artifact residue, exporter cancel-confirmation
+logging, restart convergence of stale `cancelling` rows, download/retry gating for both
+cancellation states, and legacy-task migration through Alembic 0003. The PostgreSQL opt-in
+run additionally races concurrent exporter claims and the cancel/ready row-lock decision.

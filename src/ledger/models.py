@@ -87,7 +87,8 @@ class AuditPackage(Base):
     __tablename__ = "audit_packages"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'building', 'ready', 'failed')", name="audit_package_status"
+            "status IN ('pending', 'building', 'ready', 'failed', 'cancelling', 'cancelled')",
+            name="audit_package_status",
         ),
         CheckConstraint(
             "request_fingerprint IS NOT NULL AND instrument_id IS NOT NULL "
@@ -98,14 +99,26 @@ class AuditPackage(Base):
             "(status = 'ready' AND ready_at IS NOT NULL AND failure_code IS NULL "
             "AND failure_reason IS NULL AND artifact_sha256 IS NOT NULL "
             "AND artifact_size_bytes IS NOT NULL AND event_count IS NOT NULL "
-            "AND lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "AND lease_owner IS NULL AND lease_expires_at IS NULL "
+            "AND cancel_requested_at IS NULL AND cancelled_at IS NULL) OR "
             "(status = 'failed' AND failed_at IS NOT NULL AND failure_reason IS NOT NULL) OR "
             "(status = 'pending' AND lease_owner IS NULL AND lease_expires_at IS NULL "
             "AND ready_at IS NULL AND failed_at IS NULL "
             "AND failure_code IS NULL AND failure_reason IS NULL) OR "
             "(status = 'building' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL "
             "AND ready_at IS NULL AND failed_at IS NULL "
-            "AND failure_code IS NULL AND failure_reason IS NULL)",
+            "AND failure_code IS NULL AND failure_reason IS NULL "
+            "AND cancel_requested_at IS NULL AND cancelled_at IS NULL) OR "
+            "(status = 'cancelling' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND ready_at IS NULL AND failed_at IS NULL "
+            "AND failure_code IS NULL AND failure_reason IS NULL "
+            "AND cancel_requested_at IS NOT NULL AND cancelled_at IS NULL) OR "
+            "(status = 'cancelled' AND lease_owner IS NULL AND lease_expires_at IS NULL "
+            "AND ready_at IS NULL AND failed_at IS NULL "
+            "AND failure_code IS NULL AND failure_reason IS NULL "
+            "AND artifact_sha256 IS NULL AND artifact_size_bytes IS NULL "
+            "AND event_count IS NULL AND cancel_requested_at IS NOT NULL "
+            "AND cancelled_at IS NOT NULL)",
             name="audit_package_state_shape",
         ),
         CheckConstraint("attempt_count >= 0", name="audit_package_attempts_non_negative"),
@@ -136,6 +149,8 @@ class AuditPackage(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditPackageArtifact(Base):

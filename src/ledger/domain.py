@@ -107,6 +107,14 @@ def audit_package_view(package: AuditPackage) -> dict[str, Any]:
             "reason": package.failure_reason,
             "failed_at": isoformat_utc(package.failed_at),
         }
+    cancellation = None
+    if package.cancel_requested_at is not None:
+        cancellation = {
+            "requested_at": isoformat_utc(package.cancel_requested_at),
+            "cancelled_at": (
+                isoformat_utc(package.cancelled_at) if package.cancelled_at is not None else None
+            ),
+        }
     return {
         "package_id": str(package.package_id),
         "instrument_id": package.instrument_id,
@@ -120,6 +128,7 @@ def audit_package_view(package: AuditPackage) -> dict[str, Any]:
         },
         "artifact": artifact,
         "failure": failure,
+        "cancellation": cancellation,
         "created_at": isoformat_utc(package.created_at),
         "updated_at": isoformat_utc(package.updated_at),
     }

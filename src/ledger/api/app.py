@@ -239,6 +239,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         package = await request.app.state.audit_package_service.request_retry(session, package_id)
         return {"package": audit_package_view(package)}
 
+    @app.post("/v1/audit-packages/{package_id}/cancel", tags=["audit-packages"])
+    async def cancel_audit_package(
+        package_id: uuid.UUID, session: Session, request: Request
+    ) -> dict[str, Any]:
+        package, changed = await request.app.state.audit_package_service.cancel_package(
+            session, package_id
+        )
+        return {"changed": changed, "package": audit_package_view(package)}
+
     @app.get("/v1/audit-packages/{package_id}/download", tags=["audit-packages"])
     async def download_audit_package(
         package_id: uuid.UUID, session: Session, request: Request

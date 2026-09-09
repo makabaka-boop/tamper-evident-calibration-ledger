@@ -40,7 +40,7 @@ async def run() -> None:
             try:
                 async with factory() as session:
                     result = await sealer.seal_once(session)
-                ready_path.write_text(result.status, encoding="utf-8")
+                await asyncio.to_thread(ready_path.write_text, result.status, encoding="utf-8")
                 if result.status == "sealed":
                     logger.info(
                         json.dumps(
@@ -77,7 +77,7 @@ async def run() -> None:
             except TimeoutError:
                 continue
     finally:
-        ready_path.unlink(missing_ok=True)
+        await asyncio.to_thread(ready_path.unlink, missing_ok=True)
         await engine.dispose()
 
 

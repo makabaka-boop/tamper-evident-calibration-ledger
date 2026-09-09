@@ -18,16 +18,22 @@ curl --fail http://localhost:8000/health/ready
 ```
 
 `db` first becomes healthy, the one-shot `migrate` service waits for PostgreSQL and runs Alembic,
-and only a successful migration permits `api` and `sealer` to start. A migration error therefore
-leaves the API unavailable and is visible in `docker compose logs migrate`. API readiness also
-queries both PostgreSQL and `alembic_version`. All application containers run as UID/GID 10001,
-have every Linux capability dropped, use a read-only root filesystem, and expose health checks;
-the PostgreSQL image uses its built-in unprivileged `postgres` user.
+and only a successful migration permits `api`, `sealer`, and `exporter` to start. A migration
+error therefore leaves the API unavailable and is visible in `docker compose logs migrate`. API
+readiness also queries both PostgreSQL and `alembic_version`. All application containers run as
+UID/GID 10001, have every Linux capability dropped, use a read-only root filesystem, and expose
+health checks; the PostgreSQL image uses its built-in unprivileged `postgres` user.
 
 Scale independent sealers safely with:
 
 ```sh
 docker compose up --scale sealer=3
+```
+
+Scale the independent offline-export workers the same way (see "Instrument audit packages"):
+
+```sh
+docker compose up --scale exporter=2
 ```
 
 Writers hold a shared PostgreSQL transaction advisory lock while allocating/committing their
@@ -114,6 +120,68 @@ structured errors.
 > The Compose container does not mount host receipts or keys by default. The command above adds
 > narrowly scoped read-only mounts. Never add auditor keys to the image.
 
+## Instrument audit packages
+
+An auditor can freeze a trackable, offline-verifiable export for one instrument. The boundary is
+fixed **at request time** to an already sealed checkpoint: events appended or sealed afterwards
+can never enter that package, and a failed build can be retried without moving the boundary.
+
+```sh
+curl -sS -X POST http://localhost:8000/v1/audit-packages \
+  -H 'content-type: application/json' \
+  -d '{"instrument_id":"CAL-007","idempotency_key":"audit-2026-09-09-001"}'
+```
+
+Optional `"checkpoint_id"` pins an explicit boundary; without it the newest checkpoint is used.
+`NO_SEALED_CHECKPOINT` (409) is returned when no checkpoint exists; `INSTRUMENT_HAS_NO_SEALED_EVENTS`
+(409, retryable after more sealing) when the latest boundary contains no event for the instrument;
+and `CHECKPOINT_DOES_NOT_COVER_INSTRUMENT` (409) for an explicit boundary that does not cover it.
+Retrying the same `idempotency_key` with identical parameters returns the original package
+(`created: false`); reusing a key with different parameters returns 409 `IDEMPOTENCY_CONFLICT`.
+
+Track the task and download only when ready:
+
+```sh
+curl -sS http://localhost:8000/v1/audit-packages/PACKAGE_ID
+# status is pending, building, ready, or failed; failed includes a failure code/reason and the
+# attempt_count is incremented on every claim (including crash-timeout reclaims).
+curl -fsS -o cal-007.zip \
+  http://localhost:8000/v1/audit-packages/PACKAGE_ID/download
+```
+
+Downloads of `pending`, `building`, or `failed` packages return 409 `AUDIT_PACKAGE_NOT_READY`;
+unknown packages use the standard 404 `NOT_FOUND` envelope. A terminal failure is recoverable:
+
+```sh
+curl -sS -X POST http://localhost:8000/v1/audit-packages/PACKAGE_ID/retry
+```
+
+Retry only applies to `failed` packages (other states return a distinct 409 code) and requeues the
+task without changing `instrument_id`, `checkpoint_id`, or the request fingerprint.
+
+The independent `exporter` worker claims one task at a time with `FOR UPDATE SKIP LOCKED`
+(SQLite uses an equivalent compare-and-set claim), so scaled replicas never build the same
+package. A crash mid-build leaves the row in `building` with an expiring lease; after
+`LEDGER_EXPORT_LEASE_SECONDS` any worker reclaims it and increments `attempt_count`. Database
+outages never mark a task failed. Defects in the package inputs (for example a missing signing
+key version) mark the package `failed` with a structured code so retry can succeed once fixed.
+
+The archive is a deterministic ZIP (fixed 1980 entry timestamps, DEFLATE level 9,
+Unix file modes, no extra fields) containing:
+
+```text
+receipts/event-<zero-padded database sequence>.json   # one existing-format receipt per event
+manifest.json
+```
+
+The canonical manifest records the package id, idempotency key, instrument, the signed boundary
+checkpoint, leaf/sequence bounds, the event count, every receipt file's SHA-256, and the whole
+ZIP's SHA-256/size. Rebuilding from the same database inputs yields byte-identical ZIP bytes and
+digest. Receipts contain only public commitments (`report_digest`, never the report) and the
+signed checkpoint plus inclusion/consistency proofs; **no raw report or HMAC key ever enters the
+package**. Verify every extracted receipt offline with `calibration-ledger-verify`, exactly as
+shown above.
+
 ## Key rotation
 
 Keys are a versioned environment map. Old values must remain available while their checkpoints
@@ -180,6 +248,14 @@ Recommended staging drills:
   business key, and verify exactly one event exists.
 - **Sealer crash:** kill a sealer while events are pending, start two replicas, and verify one next
   checkpoint covers the exact contiguous prefix with no duplicate leaf count.
+- **Exporter crash:** create an audit package, kill its exporter while it is `building`, wait past
+  `LEDGER_EXPORT_LEASE_SECONDS`, and confirm another replica reclaims it (higher `attempt_count`)
+  and produces a ready package whose manifest boundary is the original checkpoint.
+- **Exporter failure and retry:** point the exporter at a keyring missing the checkpoint's key
+  version, observe `failed` with `UNKNOWN_KEY_VERSION`, restore the key, `POST
+  /v1/audit-packages/{id}/retry`, and verify the ready ZIP matches the fixed boundary.
+- **Deterministic archive:** build the same package twice from restored identical data and compare
+  both ZIP bytes and the manifest archive SHA-256.
 - **Migration failure:** temporarily use a bad database URL for `migrate`; API/sealer must remain
   stopped and `docker compose logs migrate` must locate the failing revision/connection.
 - **Proof corruption:** alter one hex character in `event.report_digest`, an inclusion hash, a
@@ -212,4 +288,9 @@ TEST_DATABASE_URL=postgresql+asyncpg://ledger:test@localhost:5432/ledger_test \
 The suite covers canonicalization, idempotency conflict and retry, append-only revision/revocation
 transitions, even/odd Merkle boundaries, proof tampering, sealing batch resume, injected clocks and
 batch sizes, historical/new key verification, API error mapping, and PostgreSQL concurrent writer
-and sealer races.
+and sealer races. Audit-package coverage adds package creation and idempotency conflicts, missing
+and uncovered sealed boundaries, boundary isolation against later sealing, deterministic archive
+bytes and digests on rebuild, per-receipt offline verification inside the ZIP, dual-worker
+claiming, crash-lease recovery, terminal failure and boundary-preserving retry, download status
+gating, and database-failure mapping; the PostgreSQL opt-in run additionally races concurrent
+exporter claims.

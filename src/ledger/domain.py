@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ledger.canonical import canonical_json
 from ledger.models import Checkpoint, Event
+
+if TYPE_CHECKING:
+    from ledger.models import AuditPackage
 
 
 def utc_now() -> datetime:
@@ -86,3 +89,37 @@ def checkpoint_signing_bytes(checkpoint: Checkpoint | dict[str, Any]) -> bytes:
 
 def checkpoint_view(checkpoint: Checkpoint) -> dict[str, Any]:
     return {**checkpoint_payload(checkpoint), "signature": checkpoint.signature}
+
+
+def audit_package_view(package: AuditPackage) -> dict[str, Any]:
+    artifact: dict[str, Any] | None = None
+    if package.status == "ready":
+        artifact = {
+            "sha256": package.artifact_sha256,
+            "size_bytes": package.artifact_size_bytes,
+            "event_count": package.event_count,
+            "ready_at": isoformat_utc(package.ready_at),
+        }
+    failure = None
+    if package.status == "failed":
+        failure = {
+            "code": package.failure_code,
+            "reason": package.failure_reason,
+            "failed_at": isoformat_utc(package.failed_at),
+        }
+    return {
+        "package_id": str(package.package_id),
+        "instrument_id": package.instrument_id,
+        "checkpoint_id": str(package.checkpoint_id),
+        "status": package.status,
+        "attempt_count": package.attempt_count,
+        "event_count": package.event_count,
+        "boundary": {
+            "checkpoint_id": str(package.checkpoint_id),
+            "request_fingerprint": package.request_fingerprint,
+        },
+        "artifact": artifact,
+        "failure": failure,
+        "created_at": isoformat_utc(package.created_at),
+        "updated_at": isoformat_utc(package.updated_at),
+    }

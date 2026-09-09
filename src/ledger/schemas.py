@@ -29,6 +29,12 @@ class VerifyRequest(BaseModel):
     receipt: dict[str, Any]
 
 
+class CreateAuditPackage(BaseModel):
+    instrument_id: ShortText
+    idempotency_key: Annotated[str, Field(min_length=1, max_length=128)]
+    checkpoint_id: UUID | None = None
+
+
 class EventView(BaseModel):
     sequence: int
     event_id: UUID

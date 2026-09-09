@@ -12,13 +12,20 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ledger.audit.service import AuditPackageService
 from ledger.config import Settings, get_settings
 from ledger.db import make_engine, make_session_factory, session_dependency
-from ledger.domain import event_view
+from ledger.domain import audit_package_view, event_view
 from ledger.errors import InvalidProofError, LedgerError
 from ledger.models import Event
 from ledger.proofs import build_checkpoint_view, build_receipt, verify_receipt
-from ledger.schemas import SubmitReport, SubmitRevision, SubmitRevocation, VerifyRequest
+from ledger.schemas import (
+    CreateAuditPackage,
+    SubmitReport,
+    SubmitRevision,
+    SubmitRevocation,
+    VerifyRequest,
+)
 from ledger.security import KeyConfigurationError
 from ledger.service import EventService
 
@@ -53,6 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.session_factory = make_session_factory(engine)
         app.state.event_service = EventService()
+        app.state.audit_package_service = AuditPackageService()
         yield
         await engine.dispose()
 
@@ -205,6 +213,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise LedgerError("UNKNOWN_KEY_VERSION", str(exc), 422, {"retryable": False}) from exc
         except InvalidProofError:
             raise
+
+    @app.post("/v1/audit-packages", tags=["audit-packages"])
+    async def create_audit_package(
+        payload: CreateAuditPackage, response: Response, session: Session, request: Request
+    ) -> dict[str, Any]:
+        package, created = await request.app.state.audit_package_service.create_package(
+            session,
+            instrument_id=payload.instrument_id,
+            idempotency_key=payload.idempotency_key,
+            checkpoint_id=payload.checkpoint_id,
+        )
+        response.status_code = 201 if created else 200
+        return {"created": created, "package": audit_package_view(package)}
+
+    @app.get("/v1/audit-packages/{package_id}", tags=["audit-packages"])
+    async def get_audit_package(package_id: uuid.UUID, session: Session, request: Request) -> dict:
+        package = await request.app.state.audit_package_service.get_package(session, package_id)
+        return {"package": audit_package_view(package)}
+
+    @app.post("/v1/audit-packages/{package_id}/retry", tags=["audit-packages"])
+    async def retry_audit_package(
+        package_id: uuid.UUID, session: Session, request: Request
+    ) -> dict[str, Any]:
+        package = await request.app.state.audit_package_service.request_retry(session, package_id)
+        return {"package": audit_package_view(package)}
+
+    @app.get("/v1/audit-packages/{package_id}/download", tags=["audit-packages"])
+    async def download_audit_package(
+        package_id: uuid.UUID, session: Session, request: Request
+    ) -> Response:
+        package, artifact = await request.app.state.audit_package_service.get_ready_artifact(
+            session, package_id
+        )
+        safe_instrument = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "-"
+            for character in package.instrument_id
+        ).strip("-") or "instrument"
+        filename = f"audit-package-{safe_instrument}-{package.package_id}.zip"
+        return Response(
+            content=artifact.zip_content,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Content-SHA-256": artifact.sha256,
+            },
+        )
 
     return app
 

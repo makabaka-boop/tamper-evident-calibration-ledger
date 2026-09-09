@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -242,6 +242,16 @@ async def build_receipt(
             "inclusion_proof": None,
             "consistency_proof": None,
         }
+    return await build_receipt_at_checkpoint(session, event, checkpoint, keyring)
+
+
+async def build_receipt_at_checkpoint(
+    session: AsyncSession,
+    event: Event,
+    checkpoint: Checkpoint,
+    keyring: Mapping[str, bytes],
+) -> dict[str, Any]:
+    """Build a sealed receipt pinned to an already chosen checkpoint boundary."""
 
     events, leaves = await _validated_prefix(session, checkpoint, keyring)
     try:
@@ -249,37 +259,12 @@ async def build_receipt(
     except StopIteration as exc:
         raise LedgerError(
             "CHECKPOINT_CORRUPT",
-            "checkpoint boundary claims the event but prefix does not contain it",
+            "checkpoint boundary does not contain the event",
             500,
             {"checkpoint_id": str(checkpoint.checkpoint_id), "event_id": str(event.event_id)},
         ) from exc
     path = inclusion_proof(leaves, index)
-    consistency_bundle: dict[str, Any] | None = None
-    if checkpoint.previous_checkpoint_id:
-        previous = await session.get(Checkpoint, checkpoint.previous_checkpoint_id)
-        if not previous:
-            raise LedgerError(
-                "CHECKPOINT_CHAIN_BROKEN",
-                "adjacent checkpoint record is missing",
-                500,
-                {"checkpoint_id": str(checkpoint.checkpoint_id)},
-            )
-        await _validated_prefix(session, previous, keyring)
-        if previous.root_hash != checkpoint.previous_root_hash:
-            raise LedgerError(
-                "CHECKPOINT_CHAIN_BROKEN",
-                "adjacent checkpoint root linkage is inconsistent",
-                500,
-                {"checkpoint_id": str(checkpoint.checkpoint_id)},
-            )
-        consistency_bundle = {
-            "old_checkpoint": checkpoint_view(previous),
-            "new_checkpoint_id": str(checkpoint.checkpoint_id),
-            "old_size": previous.leaf_count,
-            "new_size": checkpoint.leaf_count,
-            "hashes": [item.hex() for item in consistency_proof(leaves, previous.leaf_count)],
-        }
-
+    consistency_bundle = await build_consistency_bundle(session, checkpoint, leaves, keyring)
     return {
         "event": event_view(event),
         "witness_status": "sealed",
@@ -293,34 +278,45 @@ async def build_receipt(
     }
 
 
+async def build_consistency_bundle(
+    session: AsyncSession,
+    checkpoint: Checkpoint,
+    leaves: Sequence[bytes],
+    keyring: Mapping[str, bytes],
+) -> dict[str, Any] | None:
+    if not checkpoint.previous_checkpoint_id:
+        return None
+    previous = await session.get(Checkpoint, checkpoint.previous_checkpoint_id)
+    if not previous:
+        raise LedgerError(
+            "CHECKPOINT_CHAIN_BROKEN",
+            "adjacent checkpoint record is missing",
+            500,
+            {"checkpoint_id": str(checkpoint.checkpoint_id)},
+        )
+    await _validated_prefix(session, previous, keyring)
+    if previous.root_hash != checkpoint.previous_root_hash:
+        raise LedgerError(
+            "CHECKPOINT_CHAIN_BROKEN",
+            "adjacent checkpoint root linkage is inconsistent",
+            500,
+            {"checkpoint_id": str(checkpoint.checkpoint_id)},
+        )
+    return {
+        "old_checkpoint": checkpoint_view(previous),
+        "new_checkpoint_id": str(checkpoint.checkpoint_id),
+        "old_size": previous.leaf_count,
+        "new_size": checkpoint.leaf_count,
+        "hashes": [item.hex() for item in consistency_proof(leaves, previous.leaf_count)],
+    }
+
+
 async def build_checkpoint_view(
     session: AsyncSession, checkpoint_id: UUID, keyring: Mapping[str, bytes]
 ) -> dict[str, Any]:
     checkpoint = await session.get(Checkpoint, checkpoint_id)
     if not checkpoint:
         raise NotFoundError("checkpoint", str(checkpoint_id))
-    events, leaves = await _validated_prefix(session, checkpoint, keyring)
-    del events
-    consistency_bundle = None
-    if checkpoint.previous_checkpoint_id:
-        previous = await session.get(Checkpoint, checkpoint.previous_checkpoint_id)
-        if not previous:
-            raise LedgerError(
-                "CHECKPOINT_CHAIN_BROKEN", "adjacent checkpoint record is missing", 500
-            )
-        await _validated_prefix(session, previous, keyring)
-        if checkpoint.previous_root_hash != previous.root_hash:
-            raise LedgerError(
-                "CHECKPOINT_CHAIN_BROKEN",
-                "adjacent checkpoint root linkage is inconsistent",
-                500,
-                {"checkpoint_id": str(checkpoint.checkpoint_id)},
-            )
-        consistency_bundle = {
-            "old_checkpoint": checkpoint_view(previous),
-            "new_checkpoint_id": str(checkpoint.checkpoint_id),
-            "old_size": previous.leaf_count,
-            "new_size": checkpoint.leaf_count,
-            "hashes": [item.hex() for item in consistency_proof(leaves, previous.leaf_count)],
-        }
+    _events, leaves = await _validated_prefix(session, checkpoint, keyring)
+    consistency_bundle = await build_consistency_bundle(session, checkpoint, leaves, keyring)
     return {"checkpoint": checkpoint_view(checkpoint), "consistency_proof": consistency_bundle}

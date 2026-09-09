@@ -28,6 +28,7 @@ test = [
 
 [project.scripts]
 calibration-ledger-sealer = "ledger.sealer:main"
+calibration-ledger-exporter = "ledger.exporter:main"
 calibration-ledger-verify = "ledger.verify:main"
 
 [tool.hatch.build.targets.wheel]

@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     current_key_version: str = "v1"
     seal_batch_size: PositiveInt = 100
     seal_poll_seconds: PositiveFloat = 2.0
+    export_poll_seconds: PositiveFloat = 2.0
+    export_lease_seconds: PositiveFloat = 120.0
     log_level: str = "INFO"
 
     @property

@@ -80,3 +80,30 @@ services:
     security_opt: ["no-new-privileges:true"]
     init: true
     restart: unless-stopped
+
+  exporter:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "ledger.exporter"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from pathlib import Path; import time; p=Path('/tmp/ledger-exporter-ready'); raise SystemExit(0 if p.exists() and time.time()-p.stat().st_mtime < 30 else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    restart: unless-stopped

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
 
 import httpx
@@ -69,6 +70,39 @@ def _app(database_url: str) -> object:
             current_key_version="v1",
         )
     )
+
+
+def test_cursor_compare_and_set_compiles_to_portable_sql() -> None:
+    # Regression: ``column IS :non_null`` parses in SQLite but is a syntax error in
+    # PostgreSQL, which surfaced as a 503 when acknowledging the checkpoint after genesis.
+    # The non-null predecessor branch must render an equality; genesis uses IS NULL.
+    from sqlalchemy import update
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from ledger.audit.consumers import _cursor_matches
+    from ledger.models import AuditConsumer
+
+    predecessor = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    successor_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+
+    advance = update(AuditConsumer).where(
+        AuditConsumer.id == 1, _cursor_matches(predecessor)
+    ).values(last_checkpoint_id=successor_id)
+    genesis = update(AuditConsumer).where(
+        AuditConsumer.id == 1, _cursor_matches(None)
+    ).values(last_checkpoint_id=successor_id)
+
+    for dialect in (postgresql.dialect(), sqlite.dialect()):
+        advance_sql = str(
+            advance.compile(dialect=dialect, compile_kwargs={"literal_binds": True})
+        )
+        # Equality on the populated predecessor; never a bare ``IS '<value>'``.
+        assert "last_checkpoint_id = " in advance_sql
+        assert "last_checkpoint_id IS '" not in advance_sql
+        genesis_sql = str(
+            genesis.compile(dialect=dialect, compile_kwargs={"literal_binds": True})
+        )
+        assert "last_checkpoint_id IS NULL" in genesis_sql
 
 
 @pytest.mark.asyncio

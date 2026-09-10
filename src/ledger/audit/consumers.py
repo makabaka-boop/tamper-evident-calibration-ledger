@@ -19,6 +19,18 @@ REGRESSED = "checkpoint_precedes_current"
 DUPLICATE = "checkpoint_already_acknowledged"
 
 
+def _cursor_matches(predecessor_id: uuid.UUID | None):
+    """Compare-and-set predicate for the stored cursor.
+
+    ``IS NULL`` is the only legal form of ``IS`` in PostgreSQL — ``column IS :non_null``
+    parses in SQLite (as IS NOT DISTINCT FROM) but is a syntax error on PostgreSQL — so a
+    populated predecessor is compared with ``=`` and only the genesis case uses ``IS NULL``.
+    """
+
+    column = AuditConsumer.last_checkpoint_id
+    return column.is_(None) if predecessor_id is None else column == predecessor_id
+
+
 class AuditConsumerService:
     """Registration points for external audit systems and their checkpoint cursors."""
 
@@ -175,7 +187,7 @@ class AuditConsumerService:
                 update(AuditConsumer)
                 .where(
                     AuditConsumer.id == consumer.id,
-                    AuditConsumer.last_checkpoint_id.is_(
+                    _cursor_matches(
                         current.checkpoint_id if current is not None else None
                     ),
                 )

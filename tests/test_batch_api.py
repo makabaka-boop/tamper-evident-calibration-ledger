@@ -38,7 +38,7 @@ async def client(tmp_path):
         current_key_version="v1",
     )
     app = create_app(settings)
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test"
@@ -160,6 +160,27 @@ async def test_batch_size_boundaries_are_validated(client) -> None:
     assert too_many.status_code == 422
     violations = too_many.json()["error"]["details"]["violations"]
     assert violations
+
+
+@pytest.mark.asyncio
+async def test_single_endpoint_non_finite_report_keeps_historical_500(client) -> None:
+    # The batch work must not change the single endpoint's status code or error shape:
+    # an uncaught canonicalization failure is still a plain 500, not BATCH_ITEM_INVALID.
+    body = (
+        '{"business_key":"night/nan-single","instrument_id":"INST-BATCH",'
+        '"operator_id":"alice","report":{"reading":NaN}}'
+    )
+    response = await client.client.post(
+        "/v1/reports",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == "Internal Server Error"
+
+    async with client.app.state.session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Event)) == 0
 
 
 @pytest.mark.asyncio

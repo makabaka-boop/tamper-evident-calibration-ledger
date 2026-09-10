@@ -67,12 +67,19 @@ class EventService:
             },
         )
 
-    def _prepare_report(self, index: int, request: SubmitReport) -> _PreparedReport:
+    def _prepare_batch_report(self, index: int, request: SubmitReport) -> _PreparedReport:
+        # The batch endpoint names the offending item; the single endpoint keeps its
+        # historical behavior and lets canonicalization errors propagate unwrapped.
         try:
             report_digest = digest_json(request.report)
         except ValueError as exc:
             raise self._invalid_report(index, request, exc) from exc
-        fingerprint = self._fingerprint(
+        fingerprint = self._report_fingerprint(request, report_digest)
+        return _PreparedReport(request, report_digest, fingerprint)
+
+    @staticmethod
+    def _report_fingerprint(request: SubmitReport, report_digest: str) -> str:
+        return EventService._fingerprint(
             {
                 "event_type": "report",
                 "business_key": request.business_key,
@@ -81,7 +88,6 @@ class EventService:
                 "report_digest": report_digest,
             }
         )
-        return _PreparedReport(request, report_digest, fingerprint)
 
     async def _existing(self, session: AsyncSession, business_key: str) -> Event | None:
         return await session.scalar(select(Event).where(Event.business_key == business_key))
@@ -136,14 +142,23 @@ class EventService:
     async def append_report(
         self, session: AsyncSession, request: SubmitReport
     ) -> tuple[Event, bool]:
-        prepared = self._prepare_report(0, request)
+        report_digest = digest_json(request.report)
+        fingerprint = self._report_fingerprint(request, report_digest)
         try:
             async with session.begin():
                 existing = await self._existing(session, request.business_key)
                 if existing:
-                    return self._check_idempotency(existing, prepared.fingerprint), False
+                    return self._check_idempotency(existing, fingerprint), False
                 await self._coordinate_insert(session)
-                event = self._new_report_event(prepared)
+                event = self._new_event(
+                    event_type="report",
+                    business_key=request.business_key,
+                    fingerprint=fingerprint,
+                    instrument_id=request.instrument_id,
+                    operator_id=request.operator_id,
+                    report_digest=report_digest,
+                    previous_event_id=None,
+                )
                 session.add(event)
                 await session.flush()
                 return event, True
@@ -151,7 +166,7 @@ class EventService:
             await session.rollback()
             existing = await self._existing(session, request.business_key)
             if existing:
-                return self._check_idempotency(existing, prepared.fingerprint), False
+                return self._check_idempotency(existing, fingerprint), False
             raise
 
     async def append_report_batch(
@@ -167,7 +182,8 @@ class EventService:
         """
 
         prepared = [
-            self._prepare_report(index, request) for index, request in enumerate(requests)
+            self._prepare_batch_report(index, request)
+            for index, request in enumerate(requests)
         ]
 
         # Detect intra-batch collisions before opening the transaction so a conflict proves

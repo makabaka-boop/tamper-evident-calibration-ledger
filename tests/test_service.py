@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 from sqlalchemy import func, select
 
+from ledger.canonical import CanonicalizationError
 from ledger.errors import LedgerError
 from ledger.models import Event
 from ledger.schemas import SubmitReport, SubmitRevision, SubmitRevocation
@@ -131,3 +134,23 @@ async def test_revision_fork_and_instrument_change_are_rejected(session_factory)
                 ),
             )
     assert fork.value.code == "EVENT_ALREADY_SUPERSEDED"
+
+
+@pytest.mark.asyncio
+async def test_single_submit_non_finite_report_propagates_canonicalization_error(
+    session_factory,
+) -> None:
+    # The single endpoint must keep its historical behavior: no batch error wrapping, no
+    # status change; the canonicalizer error surfaces untouched for the API to render 500.
+    service = EventService()
+    request = SubmitReport(
+        business_key="nan-single",
+        instrument_id="CAL-1",
+        operator_id="alice",
+        report={"reading": math.nan},
+    )
+    async with session_factory() as session:
+        with pytest.raises(CanonicalizationError):
+            await service.append_report(session, request)
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Event)) == 0

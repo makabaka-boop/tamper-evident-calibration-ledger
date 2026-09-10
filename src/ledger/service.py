@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
@@ -16,6 +17,16 @@ from ledger.errors import LedgerError, NotFoundError
 from ledger.merkle import leaf_hash
 from ledger.models import Event
 from ledger.schemas import SubmitReport, SubmitRevision, SubmitRevocation
+
+# Bound the re-check loop when concurrent writers win a business-key race.
+_BATCH_INSERT_ATTEMPTS = 4
+
+
+@dataclass(frozen=True)
+class _PreparedReport:
+    request: SubmitReport
+    report_digest: str
+    fingerprint: str
 
 
 class EventService:
@@ -41,6 +52,36 @@ class EventService:
                 {"business_key": existing.business_key, "event_id": str(existing.event_id)},
             )
         return existing
+
+    @classmethod
+    def _invalid_report(cls, index: int, request: SubmitReport, exc: Exception) -> LedgerError:
+        return LedgerError(
+            "BATCH_ITEM_INVALID",
+            "a report in the batch failed the single-report validation rules",
+            422,
+            {
+                "index": index,
+                "business_key": request.business_key,
+                "reason": "invalid_report",
+                "message": str(exc),
+            },
+        )
+
+    def _prepare_report(self, index: int, request: SubmitReport) -> _PreparedReport:
+        try:
+            report_digest = digest_json(request.report)
+        except ValueError as exc:
+            raise self._invalid_report(index, request, exc) from exc
+        fingerprint = self._fingerprint(
+            {
+                "event_type": "report",
+                "business_key": request.business_key,
+                "instrument_id": request.instrument_id,
+                "operator_id": request.operator_id,
+                "report_digest": report_digest,
+            }
+        )
+        return _PreparedReport(request, report_digest, fingerprint)
 
     async def _existing(self, session: AsyncSession, business_key: str) -> Event | None:
         return await session.scalar(select(Event).where(Event.business_key == business_key))
@@ -95,31 +136,14 @@ class EventService:
     async def append_report(
         self, session: AsyncSession, request: SubmitReport
     ) -> tuple[Event, bool]:
-        report_digest = digest_json(request.report)
-        fingerprint = self._fingerprint(
-            {
-                "event_type": "report",
-                "business_key": request.business_key,
-                "instrument_id": request.instrument_id,
-                "operator_id": request.operator_id,
-                "report_digest": report_digest,
-            }
-        )
+        prepared = self._prepare_report(0, request)
         try:
             async with session.begin():
                 existing = await self._existing(session, request.business_key)
                 if existing:
-                    return self._check_idempotency(existing, fingerprint), False
+                    return self._check_idempotency(existing, prepared.fingerprint), False
                 await self._coordinate_insert(session)
-                event = self._new_event(
-                    event_type="report",
-                    business_key=request.business_key,
-                    fingerprint=fingerprint,
-                    instrument_id=request.instrument_id,
-                    operator_id=request.operator_id,
-                    report_digest=report_digest,
-                    previous_event_id=None,
-                )
+                event = self._new_report_event(prepared)
                 session.add(event)
                 await session.flush()
                 return event, True
@@ -127,8 +151,141 @@ class EventService:
             await session.rollback()
             existing = await self._existing(session, request.business_key)
             if existing:
-                return self._check_idempotency(existing, fingerprint), False
+                return self._check_idempotency(existing, prepared.fingerprint), False
             raise
+
+    async def append_report_batch(
+        self, session: AsyncSession, requests: list[SubmitReport]
+    ) -> list[tuple[Event, bool]]:
+        """Append one to fifty reports atomically, returning results in input order.
+
+        Reports repeat the single endpoint's validation and idempotency rules. A business key
+        appearing several times in the batch with identical committed content folds onto one
+        event (the first occurrence is reported as created, later ones as not); a key reused
+        with different content, inside the batch or against a committed event, aborts the whole
+        batch and names the first offending item index.
+        """
+
+        prepared = [
+            self._prepare_report(index, request) for index, request in enumerate(requests)
+        ]
+
+        # Detect intra-batch collisions before opening the transaction so a conflict proves
+        # zero writes, and validation errors still name the earliest failing item.
+        first_index: dict[str, int] = {}
+        for index, item in enumerate(prepared):
+            prior = first_index.get(item.request.business_key)
+            if prior is None:
+                first_index[item.request.business_key] = index
+            elif prepared[prior].fingerprint != item.fingerprint:
+                raise LedgerError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "business key was already used in this batch with different content",
+                    409,
+                    {
+                        "index": index,
+                        "first_index": prior,
+                        "business_key": item.request.business_key,
+                    },
+                )
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with session.begin():
+                    return await self._insert_report_batch(session, prepared)
+            except IntegrityError as exc:
+                await session.rollback()
+                # A concurrent single or batch writer may have committed one of the keys while
+                # this transaction waited on the sequence/uniqueness constraint. Re-read: if
+                # every raced key now matches its promised content, the re-attempt collapses
+                # onto those events; otherwise the conflict surfaces with its item index.
+                conflict = await self._committed_batch_conflict(session, prepared)
+                if conflict is not None:
+                    raise conflict from None
+                if attempt >= _BATCH_INSERT_ATTEMPTS:
+                    raise exc
+
+    @staticmethod
+    async def _committed_batch_conflict(
+        session: AsyncSession, prepared: list[_PreparedReport]
+    ) -> LedgerError | None:
+        # Re-read inside an explicit transaction so the session is clean for a begin() retry
+        # when every raced key has merely been committed with identical content elsewhere.
+        async with session.begin():
+            keys = list({item.request.business_key for item in prepared})
+            existing_rows = list(
+                (
+                    await session.scalars(select(Event).where(Event.business_key.in_(keys)))
+                ).all()
+            )
+            existing = {event.business_key: event for event in existing_rows}
+            for index, item in enumerate(prepared):
+                row = existing.get(item.request.business_key)
+                if row is not None and row.content_fingerprint != item.fingerprint:
+                    return LedgerError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "business key was already used with different content",
+                        409,
+                        {
+                            "index": index,
+                            "business_key": item.request.business_key,
+                            "event_id": str(row.event_id),
+                        },
+                    )
+        return None
+
+    async def _insert_report_batch(
+        self, session: AsyncSession, prepared: list[_PreparedReport]
+    ) -> list[tuple[Event, bool]]:
+        await self._coordinate_insert(session)
+
+        keys = [item.request.business_key for item in prepared]
+        existing_rows = list(
+            (
+                await session.scalars(select(Event).where(Event.business_key.in_(keys)))
+            ).all()
+        )
+        resolved: dict[str, Event] = {event.business_key: event for event in existing_rows}
+
+        results: list[tuple[Event, bool]] = []
+        appended: dict[str, Event] = {}
+        for index, item in enumerate(prepared):
+            key = item.request.business_key
+            existing = resolved.get(key)
+            if existing is not None:
+                try:
+                    event = self._check_idempotency(existing, item.fingerprint)
+                except LedgerError as exc:
+                    exc.details = {"index": index, **exc.details}
+                    raise
+                results.append((event, False))
+                continue
+            event = appended.get(key)
+            if event is None:
+                event = self._new_report_event(item)
+                session.add(event)
+                await session.flush()
+                appended[key] = event
+                resolved[key] = event
+                results.append((event, True))
+            else:
+                # Folds onto the event appended for the key's first occurrence in this batch.
+                results.append((event, False))
+        return results
+
+    def _new_report_event(self, prepared: _PreparedReport) -> Event:
+        request = prepared.request
+        return self._new_event(
+            event_type="report",
+            business_key=request.business_key,
+            fingerprint=prepared.fingerprint,
+            instrument_id=request.instrument_id,
+            operator_id=request.operator_id,
+            report_digest=prepared.report_digest,
+            previous_event_id=None,
+        )
 
     async def append_revision(
         self, session: AsyncSession, previous_event_id: uuid.UUID, request: SubmitRevision

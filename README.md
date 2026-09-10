@@ -65,6 +65,39 @@ the sealer reaches it, `GET /v1/events/{event_id}` explicitly says `witness_stat
 After sealing, that call returns the event, signed checkpoint, inclusion proof, and (when there is
 a predecessor) an adjacent-checkpoint consistency proof.
 
+### Nightly batch submission
+
+The nighttime calibration fan-in can submit one to fifty reports in one call:
+
+```sh
+curl -sS -X POST http://localhost:8000/v1/reports/batch \
+  -H 'content-type: application/json' \
+  -d '{"reports":[
+    {"business_key":"night-2026-09-09/cal-007","instrument_id":"CAL-007","operator_id":"alice","report":{"readings":[1.001]}},
+    {"business_key":"night-2026-09-09/cal-008","instrument_id":"CAL-008","operator_id":"alice","report":{"readings":[2.001]}}
+  ]}'
+```
+
+Every item is normalized and validated by exactly the single-report rules (canonicalization,
+business key, instrument/operator), and the response `results` array mirrors input order with the
+same `created`/`event`/`witness_status` shape as `POST /v1/reports`. The batch is one
+transaction: any invalid item, business-key conflict, or write failure rolls back the entire
+request with zero rows written; the error envelope identifies the first failing zero-based
+position in `error.details.index` (batch-size violations use the standard 422
+`INVALID_REQUEST` violations list). A batch creating at least one event returns 201; a fully
+replayed batch returns 200 and every `created: false`.
+
+A business key repeated inside one batch folds onto one event when the committed content is
+identical (the first occurrence reports `created: true`, later ones `created: false` and the same
+event id); identical content already committed by another writer folds the same way. The same key
+with different content — whether inside the batch or against a committed event — returns
+409 `IDEMPOTENCY_CONFLICT` and nothing is written. Batch writers take the same shared
+write-coordination advisory lock and allocate sequences inside the single transaction, so
+concurrent batch/single writes and the sealer still observe a contiguous, unique sequence prefix.
+Batch-produced events are ordinary events: they query, revise, revoke, seal, verify offline, and
+enter audit packages exactly like single submissions.
+
+
 Append a revision and then a revocation:
 
 ```sh
@@ -328,7 +361,14 @@ TEST_DATABASE_URL=postgresql+asyncpg://ledger:test@localhost:5432/ledger_test \
 The suite covers canonicalization, idempotency conflict and retry, append-only revision/revocation
 transitions, even/odd Merkle boundaries, proof tampering, sealing batch resume, injected clocks and
 batch sizes, historical/new key verification, API error mapping, and PostgreSQL concurrent writer
-and sealer races. Audit-package coverage adds package creation and idempotency conflicts, missing
+and sealer races. Batch coverage adds three-report atomic success in input order, zero writes when
+the second item fails validation (with the failing index), intra-batch same-key folding to one
+event, same-key different-content conflict (within the batch and against committed events), full
+batch replay as 200/`created: false`, the 1–50 item bounds, batch events revising/revoking and
+sealing into receipts that verify offline, and a SQLite concurrent-batch race where the loser
+folds without duplicating or gapping sequences. The PostgreSQL opt-in run additionally races two
+large batches against ten single writers and then seals and offline-verifies every one of the 50
+new events, asserting sequences 1–50 are contiguous and unique. Audit-package coverage adds package creation and idempotency conflicts, missing
 and uncovered sealed boundaries, boundary isolation against later sealing, deterministic archive
 bytes and digests on rebuild, per-receipt offline verification inside the ZIP, dual-worker
 claiming, crash-lease recovery, terminal failure and boundary-preserving retry, download status

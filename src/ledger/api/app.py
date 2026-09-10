@@ -22,6 +22,7 @@ from ledger.proofs import build_checkpoint_view, build_receipt, verify_receipt
 from ledger.schemas import (
     CreateAuditPackage,
     SubmitReport,
+    SubmitReportBatch,
     SubmitRevision,
     SubmitRevocation,
     VerifyRequest,
@@ -149,6 +150,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         event, created = await request.app.state.event_service.append_report(session, payload)
         response.status_code = 201 if created else 200
         return {"created": created, "event": event_view(event), "witness_status": "pending"}
+
+    @app.post("/v1/reports/batch", tags=["events"])
+    async def submit_report_batch(
+        payload: SubmitReportBatch, response: Response, session: Session, request: Request
+    ) -> dict[str, Any]:
+        results = await request.app.state.event_service.append_report_batch(
+            session, payload.reports
+        )
+        # A fully replayed batch returns 200 like the single endpoint; any newly allocated
+        # sequence makes the batch a creation.
+        response.status_code = 201 if any(created for _event, created in results) else 200
+        return {
+            "results": [
+                {
+                    "created": created,
+                    "event": event_view(event),
+                    "witness_status": "pending",
+                }
+                for event, created in results
+            ]
+        }
 
     @app.post("/v1/events/{event_id}/revisions", tags=["events"])
     async def submit_revision(

@@ -7,12 +7,21 @@ from pydantic import BaseModel, Field, JsonValue
 
 ShortText = Annotated[str, Field(min_length=1, max_length=128)]
 
+# A single nighttime calibration window may fan in at most this many reports.
+MAX_BATCH_REPORTS = 50
+
 
 class SubmitReport(BaseModel):
     business_key: ShortText
     instrument_id: ShortText
     operator_id: ShortText
     report: JsonValue
+
+
+class SubmitReportBatch(BaseModel):
+    reports: Annotated[
+        list[SubmitReport], Field(min_length=1, max_length=MAX_BATCH_REPORTS)
+    ]
 
 
 class SubmitRevision(SubmitReport):

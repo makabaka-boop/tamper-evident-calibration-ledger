@@ -7,7 +7,7 @@ from ledger.canonical import canonical_json
 from ledger.models import Checkpoint, Event
 
 if TYPE_CHECKING:
-    from ledger.models import AuditPackage
+    from ledger.models import AuditConsumer, AuditPackage
 
 
 def utc_now() -> datetime:
@@ -131,4 +131,26 @@ def audit_package_view(package: AuditPackage) -> dict[str, Any]:
         "cancellation": cancellation,
         "created_at": isoformat_utc(package.created_at),
         "updated_at": isoformat_utc(package.updated_at),
+    }
+
+
+def audit_consumer_view(
+    consumer: AuditConsumer, checkpoint: Checkpoint | None = None
+) -> dict[str, Any]:
+    current: dict[str, Any] | None = None
+    if consumer.last_checkpoint_id is not None:
+        current = {
+            "checkpoint_id": str(consumer.last_checkpoint_id),
+            "leaf_count": checkpoint.leaf_count if checkpoint is not None else None,
+            "last_event_sequence": (
+                checkpoint.last_event_sequence if checkpoint is not None else None
+            ),
+            "acknowledged_at": isoformat_utc(consumer.last_acknowledged_at),
+        }
+    return {
+        "consumer_id": str(consumer.consumer_id),
+        "consumer_name": consumer.consumer_name,
+        "last_acknowledged_checkpoint": current,
+        "created_at": isoformat_utc(consumer.created_at),
+        "updated_at": isoformat_utc(consumer.updated_at),
     }

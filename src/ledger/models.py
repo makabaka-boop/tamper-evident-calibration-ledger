@@ -153,6 +153,28 @@ class AuditPackage(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AuditConsumer(Base):
+    """An external audit system's registration point with its acknowledged checkpoint cursor."""
+
+    __tablename__ = "audit_consumers"
+    __table_args__ = (
+        UniqueConstraint("consumer_id", name="uq_audit_consumers_consumer_id"),
+        UniqueConstraint("idempotency_key", name="uq_audit_consumers_idempotency_key"),
+        Index("ix_audit_consumers_name", "consumer_name"),
+    )
+
+    id: Mapped[int] = mapped_column(SequenceType, primary_key=True, autoincrement=True)
+    consumer_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    consumer_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("checkpoints.checkpoint_id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AuditPackageArtifact(Base):
     """Immutable ZIP bytes for a ready package, held in a separate row from the task."""
 

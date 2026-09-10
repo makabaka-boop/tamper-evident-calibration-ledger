@@ -12,10 +12,11 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ledger.audit.consumers import AuditConsumerService
 from ledger.audit.service import AuditPackageService
 from ledger.config import Settings, get_settings
 from ledger.db import make_engine, make_session_factory, session_dependency
-from ledger.domain import audit_package_view, event_view
+from ledger.domain import audit_consumer_view, audit_package_view, event_view, isoformat_utc
 from ledger.errors import InvalidProofError, LedgerError
 from ledger.models import Event
 from ledger.proofs import (
@@ -27,8 +28,10 @@ from ledger.proofs import (
 from ledger.schemas import (
     DEFAULT_CHECKPOINT_EVENTS_PAGE,
     MAX_CHECKPOINT_EVENTS_PAGE,
+    AcknowledgeCheckpoint,
     CreateAuditPackage,
     IntegerLiteral,
+    RegisterAuditConsumer,
     SubmitReport,
     SubmitReportBatch,
     SubmitRevision,
@@ -70,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.session_factory = make_session_factory(engine)
         app.state.event_service = EventService()
         app.state.audit_package_service = AuditPackageService()
+        app.state.audit_consumer_service = AuditConsumerService()
         yield
         await engine.dispose()
 
@@ -311,6 +315,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "X-Content-SHA-256": artifact.sha256,
             },
         )
+
+    @app.post("/v1/audit-consumers", tags=["audit-consumers"])
+    async def register_audit_consumer(
+        payload: RegisterAuditConsumer, response: Response, session: Session, request: Request
+    ) -> dict[str, Any]:
+        consumer, created = await request.app.state.audit_consumer_service.register_consumer(
+            session,
+            consumer_name=payload.consumer_name,
+            idempotency_key=payload.idempotency_key,
+        )
+        response.status_code = 201 if created else 200
+        return {"created": created, "consumer": audit_consumer_view(consumer)}
+
+    @app.get("/v1/audit-consumers/{consumer_id}", tags=["audit-consumers"])
+    async def get_audit_consumer(
+        consumer_id: uuid.UUID, session: Session, request: Request
+    ) -> dict[str, Any]:
+        service = request.app.state.audit_consumer_service
+        consumer = await service.get_consumer(session, consumer_id)
+        checkpoint = await service.current_checkpoint(session, consumer)
+        return {"consumer": audit_consumer_view(consumer, checkpoint)}
+
+    @app.post(
+        "/v1/audit-consumers/{consumer_id}/acknowledgements", tags=["audit-consumers"]
+    )
+    async def acknowledge_audit_checkpoint(
+        consumer_id: uuid.UUID,
+        payload: AcknowledgeCheckpoint,
+        response: Response,
+        session: Session,
+        request: Request,
+    ) -> dict[str, Any]:
+        consumer, checkpoint, advanced = (
+            await request.app.state.audit_consumer_service.acknowledge_checkpoint(
+                session, consumer_id, payload.checkpoint_id
+            )
+        )
+        view = audit_consumer_view(consumer, checkpoint)
+        response.status_code = 201
+        return {
+            "advanced": advanced,
+            "consumer": view,
+            "acknowledgement": {
+                "checkpoint_id": str(checkpoint.checkpoint_id),
+                "leaf_count": checkpoint.leaf_count,
+                "last_event_sequence": checkpoint.last_event_sequence,
+                "acknowledged_at": isoformat_utc(consumer.last_acknowledged_at),
+            },
+        }
 
     return app
 

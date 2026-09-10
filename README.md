@@ -274,6 +274,45 @@ signed checkpoint plus inclusion/consistency proofs; **no raw report or HMAC key
 package**. Verify every extracted receipt offline with `calibration-ledger-verify`, exactly as
 shown above.
 
+## Audit access points
+
+An external audit system registers an **access point** so the ledger can durably record which
+sealed checkpoint it has consumed up to:
+
+```sh
+curl -sS -X POST http://localhost:8000/v1/audit-consumers \
+  -H 'content-type: application/json' \
+  -d '{"consumer_name":"external-auditor-1","idempotency_key":"audit-onboard-001"}'
+```
+
+Replaying the same `idempotency_key` with identical parameters returns the original access point
+with `created: false` (HTTP 200); reusing the key with a different `consumer_name` returns 409
+`IDEMPOTENCY_CONFLICT` naming the existing consumer. Fetch the access point and its cursor with
+`GET /v1/audit-consumers/{consumer_id}`; unknown ids use the standard 404 `NOT_FOUND` envelope.
+
+After processing a batch of increment events, the auditor acknowledges the checkpoint it has
+consumed through:
+
+```sh
+curl -sS -X POST \
+  http://localhost:8000/v1/audit-consumers/CONSUMER_ID/acknowledgements \
+  -H 'content-type: application/json' \
+  -d '{"checkpoint_id":"CHECKPOINT_ID"}'
+```
+
+The cursor only moves forward along the checkpoint chain, inside one transaction. The first
+acknowledgement must be the genesis checkpoint (`previous_checkpoint_id` is null); every later one
+must name the immediate successor of the current cursor. Skips, backwards acknowledgements, and
+repeated acknowledgements return 409 `ACKNOWLEDGEMENT_CONFLICT` with a machine-readable `reason`
+(`checkpoint_is_not_first`, `checkpoint_is_not_successor`, `checkpoint_precedes_current`,
+`checkpoint_already_acknowledged`) plus the `current_checkpoint_id`, the
+`expected_predecessor_checkpoint_id`, and the submitted checkpoint/leaf count. An unknown access
+point or checkpoint returns 404 `NOT_FOUND`. Concurrent acknowledgements serialize on a compare-and-
+set cursor update: exactly one advances, the losers receive the conflict envelope after reloading
+the committed cursor, which never regresses. Access points are isolated — each keeps its own cursor
+— and registering or acknowledging never appends events, creates checkpoints, or changes audit
+packages. Database failures use the same 503 `DATABASE_UNAVAILABLE` envelope as the other routes.
+
 ## Key rotation
 
 Keys are a versioned environment map. Old values must remain available while their checkpoints

@@ -9,9 +9,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from ledger.audit.consumers import AuditConsumerService
 from ledger.audit.service import CANCELLED, AuditPackageService
 from tests.conftest import TEST_KEY_V1
 
@@ -169,7 +171,7 @@ async def test_0003_preserves_legacy_tasks_and_extends_lifecycle(postgres_url) -
         )
 
     # Apply the cancellation migration; every legacy task must survive it untouched.
-    _alembic(postgres_url, "upgrade", "head")
+    _alembic(postgres_url, "upgrade", "0003_audit_package_cancellation")
     current = _alembic(postgres_url, "current")
     assert "0003_audit_package_cancellation" in current
 
@@ -224,4 +226,97 @@ async def test_0003_preserves_legacy_tasks_and_extends_lifecycle(postgres_url) -
     assert version == "0002_audit_packages"
     assert "cancel_requested_at" not in columns
     assert "cancelled_at" not in columns
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_0004_adds_audit_consumers_and_removes_them_on_downgrade(postgres_url) -> None:
+    engine = create_async_engine(postgres_url, pool_size=4)
+    # Start from a clean database and migrate straight to head.
+    async with engine.begin() as connection:
+        await connection.execute(text("DROP TABLE IF EXISTS audit_package_artifacts"))
+        await connection.execute(text("DROP TABLE IF EXISTS audit_packages"))
+        await connection.execute(text("DROP TABLE IF EXISTS audit_consumers"))
+        await connection.execute(text("DROP TABLE IF EXISTS checkpoints"))
+        await connection.execute(text("DROP TABLE IF EXISTS events"))
+        await connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        await connection.execute(
+            text("DROP FUNCTION IF EXISTS audit_consumer_reject_identity_mutation()")
+        )
+        await connection.execute(
+            text("DROP FUNCTION IF EXISTS audit_package_reject_identity_mutation()")
+        )
+        await connection.execute(text("DROP FUNCTION IF EXISTS ledger_reject_mutation()"))
+
+    _alembic(postgres_url, "upgrade", "head")
+    assert "0004_audit_consumers" in _alembic(postgres_url, "current")
+
+    def inspect_table(sync_connection):
+        inspector = inspect(sync_connection)
+        columns = {column["name"] for column in inspector.get_columns("audit_consumers")}
+        unique = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("audit_consumers")
+        }
+        foreign_keys = {
+            constraint["referred_table"]
+            for constraint in inspector.get_foreign_keys("audit_consumers")
+        }
+        indexes = {index["name"] for index in inspector.get_indexes("audit_consumers")}
+        return columns, unique, foreign_keys, indexes
+
+    async with engine.begin() as connection:
+        columns, unique, foreign_keys, indexes = await connection.run_sync(inspect_table)
+    assert columns == {
+        "id",
+        "consumer_id",
+        "consumer_name",
+        "idempotency_key",
+        "last_checkpoint_id",
+        "created_at",
+        "updated_at",
+        "last_acknowledged_at",
+    }
+    assert unique == {"uq_audit_consumers_consumer_id", "uq_audit_consumers_idempotency_key"}
+    assert foreign_keys == {"checkpoints"}
+    assert "ix_audit_consumers_name" in indexes
+
+    # The service contract works end to end against the migration-built schema.
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    service = AuditConsumerService(clock=lambda: now)
+    async with factory() as session:
+        consumer, created = await service.register_consumer(
+            session, consumer_name="migrated-auditor", idempotency_key="migration-key"
+        )
+    assert created is True
+    async with factory() as session:
+        replay_consumer, replay_created = await service.register_consumer(
+            session, consumer_name="migrated-auditor", idempotency_key="migration-key"
+        )
+    assert replay_created is False
+    assert replay_consumer.consumer_id == consumer.consumer_id
+
+    # The fixed identity trigger forbids rewriting the registration identity.
+    async with engine.begin() as connection:
+        with pytest.raises(IntegrityError):
+            await connection.execute(
+                text(
+                    "UPDATE audit_consumers SET consumer_name = :name "
+                    "WHERE consumer_id = :cid"
+                ),
+                {"name": "tampered", "cid": consumer.consumer_id},
+            )
+
+    # Downgrading drops the table and its trigger/function while leaving prior revisions intact.
+    _alembic(postgres_url, "downgrade", "0003_audit_package_cancellation")
+    assert (
+        _alembic(postgres_url, "current").strip() == "0003_audit_package_cancellation"
+    )
+
+    async with engine.begin() as connection:
+        table_names = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).get_table_names()
+        )
+    assert "audit_consumers" not in table_names
     await engine.dispose()

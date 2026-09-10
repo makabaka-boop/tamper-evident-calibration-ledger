@@ -64,6 +64,15 @@ class CreateAuditPackage(BaseModel):
     checkpoint_id: UUID | None = None
 
 
+class RegisterAuditConsumer(BaseModel):
+    consumer_name: ShortText
+    idempotency_key: Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class AcknowledgeCheckpoint(BaseModel):
+    checkpoint_id: UUID
+
+
 class EventView(BaseModel):
     sequence: int
     event_id: UUID

@@ -5,7 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
@@ -18,8 +18,15 @@ from ledger.db import make_engine, make_session_factory, session_dependency
 from ledger.domain import audit_package_view, event_view
 from ledger.errors import InvalidProofError, LedgerError
 from ledger.models import Event
-from ledger.proofs import build_checkpoint_view, build_receipt, verify_receipt
+from ledger.proofs import (
+    build_checkpoint_event_page,
+    build_checkpoint_view,
+    build_receipt,
+    verify_receipt,
+)
 from ledger.schemas import (
+    DEFAULT_CHECKPOINT_EVENTS_PAGE,
+    MAX_CHECKPOINT_EVENTS_PAGE,
     CreateAuditPackage,
     SubmitReport,
     SubmitReportBatch,
@@ -226,6 +233,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/checkpoints/{checkpoint_id}", tags=["proofs"])
     async def get_checkpoint(checkpoint_id: uuid.UUID, session: Session) -> dict[str, Any]:
         return await build_checkpoint_view(session, checkpoint_id, configured.keyring)
+
+    @app.get("/v1/checkpoints/{checkpoint_id}/events", tags=["proofs"])
+    async def get_checkpoint_events(
+        checkpoint_id: uuid.UUID,
+        session: Session,
+        after_sequence: Annotated[int | None, Query(ge=0)] = None,
+        limit: Annotated[
+            int, Query(ge=1, le=MAX_CHECKPOINT_EVENTS_PAGE)
+        ] = DEFAULT_CHECKPOINT_EVENTS_PAGE,
+    ) -> dict[str, Any]:
+        return await build_checkpoint_event_page(
+            session, checkpoint_id, after_sequence, limit, configured.keyring
+        )
 
     @app.post("/v1/verify", tags=["proofs"])
     async def verify(payload: VerifyRequest) -> dict[str, Any]:

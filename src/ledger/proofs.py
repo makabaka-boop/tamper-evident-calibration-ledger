@@ -245,6 +245,29 @@ async def build_receipt(
     return await build_receipt_at_checkpoint(session, event, checkpoint, keyring)
 
 
+def _sealed_receipt(
+    event: Event,
+    index: int,
+    checkpoint: Checkpoint,
+    leaves: Sequence[bytes],
+    consistency_bundle: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Render the canonical sealed receipt for an event inside a validated prefix."""
+
+    path = inclusion_proof(leaves, index)
+    return {
+        "event": event_view(event),
+        "witness_status": "sealed",
+        "checkpoint": checkpoint_view(checkpoint),
+        "inclusion_proof": {
+            "leaf_index": index,
+            "tree_size": checkpoint.leaf_count,
+            "path": [{"side": item.side, "hash": item.hash.hex()} for item in path],
+        },
+        "consistency_proof": consistency_bundle,
+    }
+
+
 async def build_receipt_at_checkpoint(
     session: AsyncSession,
     event: Event,
@@ -263,19 +286,8 @@ async def build_receipt_at_checkpoint(
             500,
             {"checkpoint_id": str(checkpoint.checkpoint_id), "event_id": str(event.event_id)},
         ) from exc
-    path = inclusion_proof(leaves, index)
     consistency_bundle = await build_consistency_bundle(session, checkpoint, leaves, keyring)
-    return {
-        "event": event_view(event),
-        "witness_status": "sealed",
-        "checkpoint": checkpoint_view(checkpoint),
-        "inclusion_proof": {
-            "leaf_index": index,
-            "tree_size": checkpoint.leaf_count,
-            "path": [{"side": item.side, "hash": item.hash.hex()} for item in path],
-        },
-        "consistency_proof": consistency_bundle,
-    }
+    return _sealed_receipt(event, index, checkpoint, leaves, consistency_bundle)
 
 
 async def build_consistency_bundle(
@@ -320,3 +332,81 @@ async def build_checkpoint_view(
     _events, leaves = await _validated_prefix(session, checkpoint, keyring)
     consistency_bundle = await build_consistency_bundle(session, checkpoint, leaves, keyring)
     return {"checkpoint": checkpoint_view(checkpoint), "consistency_proof": consistency_bundle}
+
+
+async def build_checkpoint_event_page(
+    session: AsyncSession,
+    checkpoint_id: UUID,
+    after_sequence: int | None,
+    limit: int,
+    keyring: Mapping[str, bytes],
+) -> dict[str, Any]:
+    """Build one deterministic page of the increment a checkpoint newly covers.
+
+    The increment is the sequence range after the predecessor checkpoint's boundary up to and
+    including this checkpoint's ``last_event_sequence`` (the full prefix for the first
+    checkpoint). Both boundaries come from immutable checkpoint rows and the page is sliced
+    from the Merkle-validated prefix, so events or checkpoints committed later can never
+    change the result of repeating the same page request.
+    """
+
+    checkpoint = await session.get(Checkpoint, checkpoint_id)
+    if not checkpoint:
+        raise NotFoundError("checkpoint", str(checkpoint_id))
+    if checkpoint.previous_checkpoint_id is not None:
+        previous = await session.get(Checkpoint, checkpoint.previous_checkpoint_id)
+        if previous is None:
+            raise LedgerError(
+                "CHECKPOINT_CHAIN_BROKEN",
+                "adjacent checkpoint record is missing",
+                500,
+                {"checkpoint_id": str(checkpoint.checkpoint_id)},
+            )
+        increment_start = previous.last_event_sequence
+    else:
+        increment_start = 0
+    upper_bound = checkpoint.last_event_sequence
+    cursor = increment_start if after_sequence is None else after_sequence
+    if cursor < increment_start:
+        raise LedgerError(
+            "INVALID_CURSOR",
+            "after_sequence is before the checkpoint's increment start",
+            422,
+            {
+                "checkpoint_id": str(checkpoint.checkpoint_id),
+                "after_sequence": cursor,
+                "increment_start": increment_start,
+                "upper_bound": upper_bound,
+            },
+        )
+    if cursor > upper_bound:
+        raise LedgerError(
+            "INVALID_CURSOR",
+            "after_sequence is beyond the checkpoint's fixed upper bound",
+            422,
+            {
+                "checkpoint_id": str(checkpoint.checkpoint_id),
+                "after_sequence": cursor,
+                "increment_start": increment_start,
+                "upper_bound": upper_bound,
+            },
+        )
+
+    events, leaves = await _validated_prefix(session, checkpoint, keyring)
+    consistency_bundle = await build_consistency_bundle(session, checkpoint, leaves, keyring)
+    candidates = [
+        (index, item) for index, item in enumerate(events) if item.sequence > cursor
+    ]
+    has_more = len(candidates) > limit
+    page = candidates[:limit]
+    return {
+        "checkpoint_id": str(checkpoint.checkpoint_id),
+        "items": [
+            _sealed_receipt(item, index, checkpoint, leaves, consistency_bundle)
+            for index, item in page
+        ],
+        # A finished page (including an empty increment) reports no cursor rather than
+        # inventing one the client could mistake for a readable position.
+        "next_after_sequence": page[-1][1].sequence if has_more else None,
+        "has_more": has_more,
+    }

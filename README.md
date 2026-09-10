@@ -153,6 +153,33 @@ structured errors.
 > The Compose container does not mount host receipts or keys by default. The command above adds
 > narrowly scoped read-only mounts. Never add auditor keys to the image.
 
+## Checkpoint event increments
+
+An audit system can ingest exactly the events one checkpoint newly covers — those after its
+predecessor's boundary up to its own — without waiting for an offline archive:
+
+```sh
+curl -sS "http://localhost:8000/v1/checkpoints/CHECKPOINT_ID/events?limit=100"
+```
+
+The response contains `items` (one standard sealed receipt per new event, in sequence order,
+verifiable offline with `calibration-ledger-verify` exactly like `GET /v1/events/{event_id}`),
+`has_more`, and `next_after_sequence`. While `has_more` is true, feed the returned cursor back
+as `after_sequence` to read the next page:
+
+```sh
+curl -sS "http://localhost:8000/v1/checkpoints/CHECKPOINT_ID/events?after_sequence=142&limit=100"
+```
+
+Omitting `after_sequence` starts at the increment's first event (the predecessor checkpoint's
+last sequence; the full prefix for the first checkpoint). The named checkpoint is the fixed
+upper bound, so events appended or checkpoints sealed afterwards never change a repeated page
+request's result. An `after_sequence` before the increment start or beyond the checkpoint's
+own last sequence returns 422 `INVALID_CURSOR` with the valid bounds in `error.details`; a
+`limit` outside 1–500 returns the standard 422 `INVALID_REQUEST`. The final page — and an
+empty increment — returns 200 with `has_more: false` and a null `next_after_sequence` rather
+than a fabricated cursor.
+
 ## Instrument audit packages
 
 An auditor can freeze a trackable, offline-verifiable export for one instrument. The boundary is
@@ -379,3 +406,8 @@ the ready-wins 409 ordering, absence of artifact residue, exporter cancel-confir
 logging, restart convergence of stale `cancelling` rows, download/retry gating for both
 cancellation states, and legacy-task migration through Alembic 0003. The PostgreSQL opt-in
 run additionally races concurrent exporter claims and the cancel/ready row-lock decision.
+Checkpoint-increment coverage adds a full first-checkpoint read, disjoint and complete
+multi-page cursor walks across chained checkpoints, byte-identical pages after later events
+and a rotated-key sealing, invalid-cursor and limit parameter errors, an empty final page
+without a fabricated cursor, offline verification of every paged receipt, and the existing
+404/500/503 envelopes for unknown checkpoints, missing signing keys, and database outages.

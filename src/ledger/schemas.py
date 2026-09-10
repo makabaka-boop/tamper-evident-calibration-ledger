@@ -10,6 +10,11 @@ ShortText = Annotated[str, Field(min_length=1, max_length=128)]
 # A single nighttime calibration window may fan in at most this many reports.
 MAX_BATCH_REPORTS = 50
 
+# Checkpoint increment pages default to one hundred receipts and never exceed five hundred,
+# keeping each deterministic cursor page cheap to revalidate and transmit.
+DEFAULT_CHECKPOINT_EVENTS_PAGE = 100
+MAX_CHECKPOINT_EVENTS_PAGE = 500
+
 
 class SubmitReport(BaseModel):
     business_key: ShortText

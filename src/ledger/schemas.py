@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, BeforeValidator, Field, JsonValue
 
 ShortText = Annotated[str, Field(min_length=1, max_length=128)]
 
@@ -14,6 +15,20 @@ MAX_BATCH_REPORTS = 50
 # keeping each deterministic cursor page cheap to revalidate and transmit.
 DEFAULT_CHECKPOINT_EVENTS_PAGE = 100
 MAX_CHECKPOINT_EVENTS_PAGE = 500
+
+# Pagination query parameters arrive as raw strings. Pydantic's lax integer coercion would
+# silently repair inputs such as "2.0" or " 2 "; requiring an exact base-10 literal surfaces
+# them as the standard 422 INVALID_REQUEST envelope instead of a coerced page.
+_INTEGER_LITERAL = re.compile(r"[+-]?[0-9]+")
+
+
+def _require_integer_literal(value: Any) -> Any:
+    if isinstance(value, str) and not _INTEGER_LITERAL.fullmatch(value):
+        raise ValueError("must be a base-10 integer literal")
+    return value
+
+
+IntegerLiteral = Annotated[int, BeforeValidator(_require_integer_literal)]
 
 
 class SubmitReport(BaseModel):

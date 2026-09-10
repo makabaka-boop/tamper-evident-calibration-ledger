@@ -248,6 +248,51 @@ async def test_invalid_cursor_and_limit_get_clear_parameter_errors(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_non_integer_and_whitespace_padded_parameters_are_rejected(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'incr-format.db'}"
+    checkpoints = await _sealed_database(database_url)
+    second = checkpoints[1]  # increment covers sequences 4-7
+    app = _app(database_url)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            base = f"/v1/checkpoints/{second['checkpoint_id']}/events"
+            # Decimal points and surrounding whitespace must not be silently repaired
+            # into an integer page parameter.
+            malformed = [
+                ({"limit": "2.0"}, "limit"),
+                ({"limit": "2.5"}, "limit"),
+                ({"after_sequence": "3.0"}, "after_sequence"),
+                ({"after_sequence": "3.5"}, "after_sequence"),
+                ({"limit": " 2 "}, "limit"),
+                ({"limit": " 2"}, "limit"),
+                ({"limit": "2 "}, "limit"),
+                ({"after_sequence": " 3 "}, "after_sequence"),
+                ({"after_sequence": " 3"}, "after_sequence"),
+                ({"after_sequence": "3 "}, "after_sequence"),
+            ]
+            responses = [
+                (await client.get(base, params=params), field) for params, field in malformed
+            ]
+            well_formed = await client.get(base, params={"after_sequence": "3", "limit": "2"})
+
+    for response, field in responses:
+        assert response.status_code == 422
+        error = response.json()["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert error["request_id"]
+        locations = [violation["location"] for violation in error["details"]["violations"]]
+        assert ["query", field] in locations
+
+    # The same values as plain integer literals keep paginating normally.
+    assert well_formed.status_code == 200
+    body = well_formed.json()
+    assert [item["event"]["sequence"] for item in body["items"]] == [4, 5]
+    assert body["has_more"] is True
+    assert body["next_after_sequence"] == 5
+
+
+@pytest.mark.asyncio
 async def test_page_at_upper_bound_is_empty_without_fabricated_cursor(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'incr-empty.db'}"
     checkpoints = await _sealed_database(database_url)

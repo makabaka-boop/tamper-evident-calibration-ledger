@@ -28,6 +28,7 @@ from ledger.schemas import (
     DEFAULT_CHECKPOINT_EVENTS_PAGE,
     MAX_CHECKPOINT_EVENTS_PAGE,
     CreateAuditPackage,
+    IntegerLiteral,
     SubmitReport,
     SubmitReportBatch,
     SubmitRevision,
@@ -238,9 +239,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_checkpoint_events(
         checkpoint_id: uuid.UUID,
         session: Session,
-        after_sequence: Annotated[int | None, Query(ge=0)] = None,
+        after_sequence: Annotated[IntegerLiteral | None, Query(ge=0)] = None,
         limit: Annotated[
-            int, Query(ge=1, le=MAX_CHECKPOINT_EVENTS_PAGE)
+            IntegerLiteral, Query(ge=1, le=MAX_CHECKPOINT_EVENTS_PAGE)
         ] = DEFAULT_CHECKPOINT_EVENTS_PAGE,
     ) -> dict[str, Any]:
         return await build_checkpoint_event_page(
